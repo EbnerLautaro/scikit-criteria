@@ -29,55 +29,68 @@ with hidden():
 # =============================================================================
 
 
-def _rim_normalize(value, value_range, ref_ideal):
-    """Normalization function based on the reference range and ideal."""
-    A, B = value_range
-    C, D = ref_ideal
+def _rim_normalize_matrix(matrix, ref_intervals, bounds):
+    norm_matrix = np.asarray(matrix, dtype=float)
+    ref_intervals = np.asarray(ref_intervals)
+    bounds = np.asarray(bounds)
 
-    if C <= value <= D:
-        return 1.0
-    elif A != C and A <= value < C:
-        return 1 - min(abs(value - C), abs(value - D)) / abs(A - C)
-    elif D != B and D < value <= B:
-        return 1 - min(abs(value - C), abs(value - D)) / abs(D - B)
-    else:
-        raise ValueError(
-            "Invalid value to normalize. Outside the accepted range."
-        )
+    min_vals = bounds[:, 0]  # A: Lower bound
+    max_vals = bounds[:, 1]  # B: Upper bound
+    ideal_min = ref_intervals[:, 0]  # C: Ideal lower bound
+    ideal_max = ref_intervals[:, 1]  # D: Ideal upper bound
+
+    # Condition 1: C <= X <= D → 1.0
+    within_ideal = (matrix >= ideal_min) & (matrix <= ideal_max)
+    norm_matrix[within_ideal] = 1.0
+
+    # Condition 2: A <= X < C and A != C
+    left_side = (
+        (matrix >= min_vals) & (matrix < ideal_min) & (min_vals != ideal_min)
+    )
+    dist_to_ideal_min = np.abs(matrix - ideal_min)
+    dist_to_ideal_max = np.abs(matrix - ideal_max)
+    denom_left = np.abs(min_vals - ideal_min)
+
+    left_values = 1 - (
+        np.minimum(dist_to_ideal_min, dist_to_ideal_max) / denom_left
+    )
+    norm_matrix[left_side] = left_values[left_side]
+
+    # Condition 3: D < X <= B and D != B
+    right_side = (
+        (matrix > ideal_max) & (matrix <= max_vals) & (ideal_max != max_vals)
+    )
+    dist_to_ideal_min = np.abs(matrix - ideal_min)
+    dist_to_ideal_max = np.abs(matrix - ideal_max)
+    denom_right = np.abs(ideal_max - max_vals)
+
+    right_values = 1 - (
+        np.minimum(dist_to_ideal_min, dist_to_ideal_max) / denom_right
+    )
+    norm_matrix[right_side] = right_values[right_side]
+
+    return norm_matrix
 
 
-def _rim(matrix, weights, ref_ideals, ranges):
+def _rim(matrix, weights, ref_intervals, bounds):
 
-    # Normalize the valuation matrix X
-    norm_matrix = np.empty_like(matrix, dtype=float)
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            norm_matrix[i, j] = _rim_normalize(
-                matrix[i, j],
-                ranges[j],
-                ref_ideals[j],
-            )
-
-    # Calculate the weighted normalized matrix
+    norm_matrix = _rim_normalize_matrix(matrix, ref_intervals, bounds)
     weighted_matrix = norm_matrix * weights
 
-    # Calculate the variation to the normalized
-    # reference ideal for each alternative
-    i_plus = np.linalg.norm(
-        weighted_matrix - weights, axis=1
-    )  # distance to ideal
-    i_minus = np.linalg.norm(weighted_matrix, axis=1)  # distance to origin
+    distance_to_ideal = np.linalg.norm(weighted_matrix - weights, axis=1)
+    distance_to_origin = np.linalg.norm(weighted_matrix, axis=1)
 
-    # Calculate the relative index of each alternative
-    R = i_minus / (i_plus + i_minus)
-    ranking = rank.rank_values(R, reverse=True)
+    similarity_ratio = distance_to_origin / (
+        distance_to_ideal + distance_to_origin
+    )
+    ranking = rank.rank_values(similarity_ratio, reverse=True)
 
     return ranking, {
-        "score": R,
+        "score": similarity_ratio,
         "norm_matrix": norm_matrix,
         "weighted_matrix": weighted_matrix,
-        "i_plus": i_plus,
-        "i_minus": i_minus,
+        "i_plus": distance_to_ideal,
+        "i_minus": distance_to_origin,
     }
 
 
@@ -111,7 +124,11 @@ class RIM(SKCDecisionMakerABC):
 
         ranking, method_extra = _rim(matrix, weights, ref_ideals, ranges)
 
-        extra = {"ref_ideals": ref_ideals, "ranges": ranges, **method_extra}
+        extra = {
+            "ref_ideals": ref_ideals,
+            "ranges": ranges,
+            **method_extra,
+        }
 
         return ranking, extra
 
@@ -136,6 +153,9 @@ class RIM(SKCDecisionMakerABC):
 
         if ref_ideals is None or ranges is None:
             raise ValueError("Both `ref_ideals` and `ranges` are required.")
+
+        ref_ideals = np.asarray(ref_ideals)
+        ranges = np.asarray(ranges)
 
         self._validate_ranges(data["matrix"], ref_ideals, ranges)
 
@@ -168,10 +188,24 @@ class RIM(SKCDecisionMakerABC):
                 "ref_ideals length must match number of criteria."
             )
         if len(ranges) != n_criteria:
-            raise ValueError("ranges length must match number of criteria.")
+            raise ValueError("Ranges length must match number of criteria.")
 
-        for i, (ideal, valid_range) in enumerate(zip(ref_ideals, ranges)):
-            if not (valid_range[0] <= ideal[0] <= ideal[1] <= valid_range[1]):
-                raise ValueError(
-                    f"{ideal} must be within ranges[{i}] = {valid_range}"
-                )
+        if ranges.shape != (matrix.shape[1], 2):
+            raise ValueError(
+                f"Invalid shape for ranges. It must be (n_criteria, 2). \
+                Got: {ranges.shape}."
+            )
+
+        min_range, max_range = ranges[:, 0], ranges[:, 1]
+
+        ideals_within_ranges = (ref_ideals.T >= min_range) & (
+            ref_ideals.T <= max_range
+        )
+        if not np.all(ideals_within_ranges):
+            raise ValueError("Ideals must be within ranges")
+
+        values_within_ranges = (matrix >= min_range) & (matrix <= max_range)
+        if not np.all(values_within_ranges):
+            raise ValueError(
+                "Some values are outside the accepted normalization range."
+            )
